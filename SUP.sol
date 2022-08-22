@@ -43,19 +43,12 @@ library SafeMath {
 
 interface SUPInterface {
     event WinBonus(address _miner);
-    event RetriveBonus();
+    event RetriveBonus(uint256 _amount);
 
-    function commitAnswer(uint256 _hash) external;
-
-    function secretConveyAnswer() external;
-
-    function approveAnswer(address _answerProvider) external payable;
-
-    function declineAnswer(address _answerProvider) external;
+    function commitAnswer(uint256 _hash, uint256 _bonusLevel) external;
 
     function revealAnswer(uint256[] calldata _decodeAnswer)
         external
-        payable
         returns (bool _result);
 
     function settlement() external payable;
@@ -63,52 +56,430 @@ interface SUPInterface {
     function retrieveBonus() external payable returns (bool _result);
 }
 
-contract SUP {
+abstract contract SUP {
     using SafeMath for uint256;
-    //记录constraint
-    struct couple {
-        uint256 varible1;
-        uint256 varible2;
-    }
 
+    ///@notice the struct that record the commit info
+    ///'answerHash' is uint(keccak256(abi.encodePacked(uint[])))
+    ///@dev remember to initialize isUsed
     struct commitRecord {
-        address commiter;
+        bool isUsed;
         uint256 commitTime;
-        uint256 conveyTime;
         uint256 bonusLevel;
         uint256 answerHash;
         uint256[] revealAnswer;
+        bool revealResult;
     }
 
-    //合约参数
-    //发布者
-    address owner;
-    //发布者设置的奖金
-    uint256 bonus;
-    //最小赎回时间
-    uint256 minimumRetrieveTime;
-    //奖励列表
-    mapping(uint256 => uint256) bonusList;
+    ///@dev static data
+    ///the proposer/owner
+    address payable owner;
+    ///the total token the owner put into the contract
+    uint256 settedBonus;
+    ///@notice when all the procedure ends and the owner wanna to retrieve the balance,
+    ///the contract need to transfer to the owner, while this Tx needs gas fee,
+    ///therefore, excessive fee should be kept in the contract,
+    ///or the balance in contract cannot be retrieved.
+    uint256 txFee;
+    ///whether this is CSP, formulus calculating or sth else
+    string problemType;
+    ///whether any valid answer is provided
+    bool isSolved;
+    ///the minimum and maximum interval between commit and reveal
+    uint256 tcrmin;
+    uint256 tcrmax;
+    ///the deadline of committing,
+    ///tCommitDeadline = tLauch + tlcInterval
+    uint256 tlcInterval;
+    uint256 tCommitDeadline;
+    ///the time to settle, that is to decide the winner
+    ///tSettlement = tLaunch + tlsInterval
+    uint256 tcsInterval;
+    uint256 tSettlement;
+    ///only after this time can the
+    ///@dev notice the relation constraints within the T varibles
+    ///tRetrieval = tLaunch + tlrInterval
+    uint256 tsrInterval;
+    uint256 tRetrieval;
 
-    //proposal的问题描述
-    //变量
-    uint256[] _varibles;
-    //变量的取值
-    mapping(uint256 => uint256[]) _domains;
-    //变量的约束条件
-    couple[] _constraints;
+    ///@dev dynamic data
+    ///the mapping and address list that collect the info of the answer commiter
+    mapping(address => commitRecord) commitList;
+    address payable[] commiterList;
+    ///the proposing time
+    uint256 tPropose;
+    ///final bonus winner
+    address payable winner;
+    ///the final bonus winner wins
+    uint256 winBonus;
+    ///@dev the proposer can change the constrains before the contract launch
+    bool isLaunched;
+    ///@dev all the time point should be relative with 'tLaunch',
+    ///rather than 'tPropose'
+    uint256 tLaunch;
+    ///already claim the bonus or not
+    bool isClaimed;
 
-    //动态数据
-    //提交者的信息集
-    commitRecord[] commitList;
-    //提交者优先级列表（仅包含同一等级最先发布的提交者）
-    uint256[] commiterPrioity;
-    //发布时间
-    uint256 proposeTime;
-    //当前最高的答案等级
-    uint256 hightestLevel;
-    //当前最高等级的第一个答案commit时间
-    uint256 highestLevelCommitTime;
-    //若发布者没有approveAnswer，则合约会在验证合格后通过revealAnswer将答案写入finalAnswer
+    bool isRetrieved;
+    ///the final answer of the problem
     uint256[] finalAnswer;
+
+    ///@dev two events that do with token transfer
+    event WinBonus(address _miner);
+    event RetriveBonus(uint256 _amount);
+
+    ///@notice the proposer can add condition to the contract
+    ///after the proposerTx and before the contract is finally launched.
+    function launchProblem() public onlyOwner {
+        require(!isLaunched);
+        tLaunch = block.timestamp;
+        isLaunched = true;
+        tCommitDeadline = tLaunch.add(tlcInterval);
+        tSettlement = tCommitDeadline.add(tcsInterval);
+        tRetrieval = tSettlement.add(tsrInterval);
+    }
+
+    ///@notice when the miner work out the answer, he/she will commit the
+    ///hash of the answer and the bonusLevel of its answer. The hashing process
+    ///prevent the malicious node to steal the answer when they detect before the
+    ///answer is verified on the chain.
+    ///@param _hash the hash function used here is keccak256
+    ///@dev needa to make sure the time is before the tCommitDeadline,
+    ///and after the proposer is launched.
+    function commitAnswer(uint256 _hash, uint256 _bonusLevel)
+        external
+        alreadyLaunch
+    {
+        require(block.timestamp <= tCommitDeadline);
+        commiterList.push(payable(msg.sender));
+        commitRecord storage commiter = commitList[msg.sender];
+        commiter.isUsed = true;
+        commiter.answerHash = _hash;
+        commiter.bonusLevel = _bonusLevel;
+        commiter.commitTime = block.timestamp;
+    }
+
+    ///@notice when the contract owner decline or neglect the answer, the miner can
+    ///still challenge by reveal the original answer and verify the answer.
+    ///@dev few steps:
+    ///1.address already committed
+    ///2.check the "tccmin <= now - commitTime <= Tccmax"
+    ///3.verify the answer and record
+    function revealAnswer(uint256[] calldata _decodeAnswer)
+        external
+        alreadyCommit
+        returns (bool _result)
+    {
+        commitRecord storage commiter = commitList[msg.sender];
+        require(
+            (block.timestamp - commiter.commitTime >= tcrmin) &&
+                (block.timestamp - commiter.commitTime <= tcrmax)
+        );
+        require(verifyAnswer(_decodeAnswer));
+        commiter.revealAnswer = _decodeAnswer;
+        commiter.revealResult = true;
+        return true;
+    }
+
+    ///@notice calculating the bonus the user can get with the answer
+    ///@param _answer the answer of the user
+    ///the default format is int[]
+    ///this can be implemented in the description of the problem
+    ///@return bonus the bonus the user can get
+    ///@dev inherit this virtual funtion in the actual contract
+    function calBonus(uint256[] memory _answer)
+        public
+        view
+        virtual
+        returns (uint256 bonus);
+
+    ///@notice verify whether the decode answer accord with the requirement
+    ///and check whether the user has change its answer compared with the hash
+    ///during the commit time.
+    ///This function contains three validation part:
+    ///1.check whether the sender has committed
+    ///2.check whether the answer conform to the bonus level it claim
+    ///3.check the hash of the decode answer is the same with the hash it claim during commit Tx
+    ///@param _answer the answer of the sender
+    ///@return result whether both three validations mentioned above, is passed
+    function verifyAnswer(uint256[] memory _answer)
+        public
+        view
+        returns (bool result)
+    {
+        commitRecord memory commiter = commitList[msg.sender];
+        require(calBonus(_answer) == commiter.bonusLevel);
+        require(encodeAnswer(_answer) == commiter.answerHash);
+        return true;
+    }
+
+    ///@notice when "now > tSettlement", anyone can call this funtion to raise settlement,
+    ///while usually the miner who wins will call this function.
+    ///@dev few steps:
+    ///1."now > tSettlement"
+    ///2.find the winner from the commitList
+    function settlement() public payable {
+        require(block.timestamp > tSettlement);
+        if (commiterList.length == 0) {
+            isSolved = false;
+        }
+        address payable winer;
+        uint256 winnerBonus;
+        bool anyValidUser;
+
+        for (uint256 i = 0; i < commiterList.length; i++) {
+            address payable commiter = commiterList[i];
+            commitRecord memory commitInfo = commitList[commiter];
+            //when no valid answer is found in the list
+            if (!anyValidUser) {
+                if (commitInfo.revealResult) {
+                    winer = commiter;
+                    winnerBonus = commitInfo.bonusLevel;
+                    anyValidUser = true;
+                }
+            } else {
+                if (commitInfo.revealResult) {
+                    if (commitInfo.bonusLevel > winnerBonus) {
+                        winer = commiter;
+                        winnerBonus = commitInfo.bonusLevel;
+                    }
+                }
+            }
+        }
+
+        if (!anyValidUser) {
+            isSolved = false;
+        } else {
+            if (!isClaimed) {
+                winner = winer;
+                winBonus = winnerBonus;
+                finalAnswer = commitList[winner].revealAnswer;
+                winner.transfer(winBonus);
+                emit WinBonus(winner);
+            }
+        }
+    }
+
+    ///@notice after the Retrieve Time, the owner can claim the deposit inside of the contract
+    function retrieveBonus() external payable onlyOwner returns (bool _result) {
+        require(block.timestamp >= tRetrieval);
+        require(!isSolved || isClaimed);
+        require(!isRetrieved);
+        uint256 amount = address(this).balance - txFee;
+        owner.transfer(amount);
+        emit RetriveBonus(amount);
+        return true;
+    }
+
+    function encodeAnswer(uint256[] memory _decodeAnswer)
+        public
+        pure
+        returns (uint256 _result)
+    {
+        return uint256(keccak256(abi.encodePacked(_decodeAnswer)));
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner);
+        _;
+    }
+
+    modifier alreadyLaunch() {
+        require(isLaunched);
+        _;
+    }
+
+    modifier BeforeLaunch() {
+        require(!isLaunched);
+        _;
+    }
+
+    modifier alreadyCommit() {
+        require(commitList[msg.sender].isUsed == true);
+        _;
+    }
+}
+
+contract CSPContract is SUP {
+    using SafeMath for uint256;
+    struct varibleDomain {
+        bool isRestricted;
+        uint256[] domain;
+    }
+    ///@notice CSP(constraints satisfying problem) consists of three part:
+    ///1.varibles: here, to save the memory, we use 0,1,2,...N-1 to represent N varibles.
+    ///2.domains: that is, the value each varibles can be.
+    ///3.constraints: the condition that the varibles should satisfy.
+    uint256 varibles;
+    uint256 colors;
+    mapping(uint256 => varibleDomain) domains;
+    uint256 constraintsNumber;
+    mapping(uint256 => uint256[]) constraints;
+    uint256[] bonusTable;
+    ///the sum of the bonus in bonusTable
+    uint256 totalBonusTableValue;
+
+    constructor(
+        uint256 _txFee,
+        string memory _problemType,
+        uint256 _tcrmin,
+        uint256 _tcrmax,
+        uint256 _tlcInterval,
+        uint256 _tcsInterval,
+        uint256 _tsrInterval,
+        uint256 _varibles,
+        uint256 _colors
+    ) payable {
+        require(_tcrmax > _tcrmin);
+        require(_tcsInterval > _tcrmax);
+
+        owner = payable(msg.sender);
+        tPropose = block.timestamp;
+        settedBonus = msg.value;
+        txFee = _txFee;
+        problemType = _problemType;
+        tcrmax = _tcrmax;
+        tcrmin = _tcrmin;
+        tlcInterval = _tlcInterval;
+        tcsInterval = _tcsInterval;
+        tsrInterval = _tsrInterval;
+
+        varibles = _varibles;
+        colors = _colors;
+        constraintsNumber = 0;
+        totalBonusTableValue = 0;
+    }
+
+    ///@notice only adding varibles and adding colors is allowed,
+    ///because deleting varibles need great changes to the memory.
+    function addVaribles(uint256 _varibles) public onlyOwner BeforeLaunch {
+        require(_varibles > varibles);
+        varibles = _varibles;
+    }
+
+    function addColors(uint256 _colors) public onlyOwner BeforeLaunch {
+        require(_colors > colors);
+        colors = _colors;
+    }
+
+    ///@dev few step:
+    ///1. verify the _constraint is legitimate, that is without replicate and in increasing order
+    ///2. add the constraint to the constraints, bonusTable, constraintsNumber
+    function addConstraints(
+        uint256[] memory _constraint,
+        uint256 _constraintBonus
+    ) public onlyOwner BeforeLaunch {
+        require(checkIsIncreasingAndDifferent(_constraint));
+        //due to the increasing order, verifying the last element is adequate.
+        require(_constraint[_constraint.length - 1] < varibles);
+
+        constraints[constraintsNumber] = _constraint;
+        require(
+            (totalBonusTableValue.add(_constraintBonus)) <=
+                settedBonus.sub(txFee)
+        );
+        totalBonusTableValue.add(_constraintBonus);
+        bonusTable.push(_constraintBonus);
+        constraintsNumber++;
+    }
+
+    function addDomain(uint256 _varible, uint256[] memory _domain)
+        public
+        onlyOwner
+        BeforeLaunch
+    {
+        require(checkIsIncreasingAndDifferent(_domain));
+        require(_domain[_domain.length - 1] < colors);
+        domains[_varible].isRestricted = true;
+        domains[_varible].domain = _domain;
+    }
+
+    ///@notice avoid the same element in the domain and constraint
+    function checkIsIncreasingAndDifferent(uint256[] memory _input)
+        public
+        pure
+        returns (bool _result)
+    {
+        for (uint256 i = 0; i < _input.length - 1; i++) {
+            if (_input[i] >= _input[i + 1]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ///@notice given the specific varible and according value,
+    ///verify whether this satisfied the domains
+    function domainSatisfy(uint256 _elem, uint256 _elemVal)
+        internal
+        view
+        returns (bool _result)
+    {
+        if (_elemVal >= colors) {
+            return false;
+        }
+        varibleDomain memory domain = domains[_elem];
+        if (!domain.isRestricted) {
+            return true;
+        }
+        for (uint256 i = 0; i < varibles; i++) {
+            if (domain.domain[i] == _elemVal) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function allDomainSatisfy(uint256[] memory _variblesVal)
+        public
+        view
+        returns (bool _result)
+    {
+        for (uint256 i = 0; i < varibles; i++) {
+            if (!domainSatisfy(i, _variblesVal[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ///@notice varify whether the answer satisfy single constraint
+    ///@param _variblesVal the value of the varibles
+    ///@param _constraint the single constraint the varible should satisfy
+    ///@dev notice that, the varible may not satisfy the domains conditon,
+    ///omitting this judgement aims to lessen the calculation cost
+    function elemConsSatisfy(
+        uint256[] memory _variblesVal,
+        uint256[] memory _constraint
+    ) public pure returns (bool _result) {
+        for (uint256 i = 0; i < _constraint.length; i++) {
+            for (uint256 j = i + 1; j < _constraint.length; j++) {
+                if (
+                    _variblesVal[_constraint[i]] == _variblesVal[_constraint[j]]
+                ) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    function calBonus(uint256[] memory _answer)
+        public
+        view
+        override
+        returns (uint256 bonus)
+    {
+        uint256 presentBonus = 0;
+        require(_answer.length == varibles);
+        if (!allDomainSatisfy(_answer)) {
+            return 0;
+        }
+        for (uint256 i = 0; i < constraintsNumber; i++) {
+            if (elemConsSatisfy(_answer, constraints[i])) {
+                presentBonus.add(bonusTable[i]);
+            }
+        }
+        return presentBonus;
+    }
 }
