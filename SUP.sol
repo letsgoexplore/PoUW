@@ -42,6 +42,7 @@ library SafeMath {
 }
 
 interface SUPInterface {
+    ///@dev two events that do with token transfer
     event WinBonus(address _miner);
     event RetriveBonus(uint256 _amount);
 
@@ -54,9 +55,17 @@ interface SUPInterface {
     function settlement() external payable;
 
     function retrieveBonus() external payable returns (bool _result);
+
+    function encodeAnswer(uint256[] calldata _decodeAnswer)
+        external
+        returns (uint256 _result);
+
+    function calBonus(uint256[] memory _answer)
+        external
+        returns (uint256 bonus);
 }
 
-abstract contract SUP {
+abstract contract SUP is SUPInterface {
     using SafeMath for uint256;
 
     ///@notice the struct that record the commit info
@@ -124,10 +133,6 @@ abstract contract SUP {
     bool isRetrieved;
     ///the final answer of the problem
     uint256[] finalAnswer;
-
-    ///@dev two events that do with token transfer
-    event WinBonus(address _miner);
-    event RetriveBonus(uint256 _amount);
 
     ///@notice the proposer can add condition to the contract
     ///after the proposerTx and before the contract is finally launched.
