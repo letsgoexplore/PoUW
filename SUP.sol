@@ -1,4 +1,4 @@
-pragma solidity ^0.8.16;
+pragma solidity ^0.8.7;
 
 library SafeMath {
     /**
@@ -60,7 +60,8 @@ abstract contract SUP {
     using SafeMath for uint256;
 
     ///@notice the struct that record the commit info
-    ///'answerHash' is uint(keccak256(abi.encodePacked(uint[])))
+    ///'answerHash' is uint(keccak256(abi.encodePacked(uint[], address(msg.sender))))
+    ///there is "encodeAnswer" function
     ///@dev remember to initialize isUsed
     struct commitRecord {
         bool isUsed;
@@ -203,13 +204,17 @@ abstract contract SUP {
     ///@param _answer the answer of the sender
     ///@return result whether both three validations mentioned above, is passed
     function verifyAnswer(uint256[] memory _answer)
-        public
+        internal
         view
         returns (bool result)
     {
         commitRecord memory commiter = commitList[msg.sender];
-        require(calBonus(_answer) == commiter.bonusLevel);
-        require(encodeAnswer(_answer) == commiter.answerHash);
+        if (calBonus(_answer) == commiter.bonusLevel) {
+            return false;
+        }
+        if (encodeAnswer(_answer) == commiter.answerHash) {
+            return false;
+        }
         return true;
     }
 
@@ -273,11 +278,16 @@ abstract contract SUP {
 
     function encodeAnswer(uint256[] memory _decodeAnswer)
         public
-        pure
+        view
         returns (uint256 _result)
     {
-        return uint256(keccak256(abi.encodePacked(_decodeAnswer)));
+        return
+            uint256(
+                keccak256(abi.encodePacked(_decodeAnswer, address(msg.sender)))
+            );
     }
+
+    fallback() external {}
 
     modifier onlyOwner() {
         require(msg.sender == owner);
@@ -396,7 +406,7 @@ contract CSPContract is SUP {
 
     ///@notice avoid the same element in the domain and constraint
     function checkIsIncreasingAndDifferent(uint256[] memory _input)
-        public
+        internal
         pure
         returns (bool _result)
     {
@@ -451,7 +461,7 @@ contract CSPContract is SUP {
     function elemConsSatisfy(
         uint256[] memory _variblesVal,
         uint256[] memory _constraint
-    ) public pure returns (bool _result) {
+    ) internal pure returns (bool _result) {
         for (uint256 i = 0; i < _constraint.length; i++) {
             for (uint256 j = i + 1; j < _constraint.length; j++) {
                 if (
@@ -477,7 +487,7 @@ contract CSPContract is SUP {
         }
         for (uint256 i = 0; i < constraintsNumber; i++) {
             if (elemConsSatisfy(_answer, constraints[i])) {
-                presentBonus.add(bonusTable[i]);
+                presentBonus = presentBonus.add(bonusTable[i]);
             }
         }
         return presentBonus;
