@@ -46,20 +46,32 @@ interface SUPInterface {
     event WinBonus(address _miner);
     event RetriveBonus(uint256 _amount);
 
+    ///@notice when the miner work out the answer, he/she will commit the
+    ///hash of the answer and the bonusLevel of its answer. The hashing process
+    ///prevent the malicious node to steal the answer when they detect before the
+    ///answer is verified on the chain.
     function commitAnswer(uint256 _hash, uint256 _bonusLevel) external;
 
+    ///@notice when the contract owner decline or neglect the answer, the miner can
+    ///still challenge by reveal the original answer and verify the answer.
     function revealAnswer(uint256[] calldata _decodeAnswer)
         external
         returns (bool _result);
 
+    ///@notice when "now > tSettlement", anyone can call this funtion to raise settlement,
+    ///while usually the miner who wins will call this function.
     function settlement() external payable;
 
+    ///@notice after the Retrieve Time, the owner can claim the deposit inside of the contract
     function retrieveBonus() external payable returns (bool _result);
 
+    ///@notice this is the hash function used in the contract
+    ///it encode the answer with the msg.sender's address
     function encodeAnswer(uint256[] calldata _decodeAnswer)
         external
         returns (uint256 _result);
 
+    ///@notice calculating the bonus the user can get with the answer
     function calBonus(uint256[] memory _answer)
         external
         returns (uint256 bonus);
@@ -86,11 +98,6 @@ abstract contract SUP is SUPInterface {
     address payable owner;
     ///the total token the owner put into the contract
     uint256 settedBonus;
-    ///@notice when all the procedure ends and the owner wanna to retrieve the balance,
-    ///the contract need to transfer to the owner, while this Tx needs gas fee,
-    ///therefore, excessive fee should be kept in the contract,
-    ///or the balance in contract cannot be retrieved.
-    uint256 txFee;
     ///whether this is CSP, formulus calculating or sth else
     string problemType;
     ///whether any valid answer is provided
@@ -127,9 +134,9 @@ abstract contract SUP is SUPInterface {
     ///@dev all the time point should be relative with 'tLaunch',
     ///rather than 'tPropose'
     uint256 tLaunch;
-    ///already claim the bonus or not
-    bool isClaimed;
-
+    ///already settle
+    bool isSettled;
+    ///owner already retrieved back balance
     bool isRetrieved;
     ///the final answer of the problem
     uint256[] finalAnswer;
@@ -163,6 +170,7 @@ abstract contract SUP is SUPInterface {
         commiter.answerHash = _hash;
         commiter.bonusLevel = _bonusLevel;
         commiter.commitTime = block.timestamp;
+        commiter.revealResult = false;
     }
 
     ///@notice when the contract owner decline or neglect the answer, the miner can
@@ -214,10 +222,10 @@ abstract contract SUP is SUPInterface {
         returns (bool result)
     {
         commitRecord memory commiter = commitList[msg.sender];
-        if (calBonus(_answer) == commiter.bonusLevel) {
+        if (calBonus(_answer) != commiter.bonusLevel) {
             return false;
         }
-        if (encodeAnswer(_answer) == commiter.answerHash) {
+        if (encodeAnswer(_answer) != commiter.answerHash) {
             return false;
         }
         return true;
@@ -229,13 +237,15 @@ abstract contract SUP is SUPInterface {
     ///1."now > tSettlement"
     ///2.find the winner from the commitList
     function settlement() public payable {
+        require(!isSettled);
         require(block.timestamp > tSettlement);
         if (commiterList.length == 0) {
             isSolved = false;
         }
         address payable winer;
         uint256 winnerBonus;
-        bool anyValidUser;
+        uint256 winnerTime;
+        bool anyValidUser = false;
 
         for (uint256 i = 0; i < commiterList.length; i++) {
             address payable commiter = commiterList[i];
@@ -245,11 +255,16 @@ abstract contract SUP is SUPInterface {
                 if (commitInfo.revealResult) {
                     winer = commiter;
                     winnerBonus = commitInfo.bonusLevel;
+                    winnerTime = commitInfo.commitTime;
                     anyValidUser = true;
                 }
             } else {
                 if (commitInfo.revealResult) {
-                    if (commitInfo.bonusLevel > winnerBonus) {
+                    if (
+                        (commitInfo.bonusLevel > winnerBonus) ||
+                        (commitInfo.bonusLevel == winnerBonus &&
+                            commitInfo.commitTime < winnerTime)
+                    ) {
                         winer = commiter;
                         winnerBonus = commitInfo.bonusLevel;
                     }
@@ -260,27 +275,28 @@ abstract contract SUP is SUPInterface {
         if (!anyValidUser) {
             isSolved = false;
         } else {
-            if (!isClaimed) {
-                winner = winer;
-                winBonus = winnerBonus;
-                finalAnswer = commitList[winner].revealAnswer;
-                winner.transfer(winBonus);
-                emit WinBonus(winner);
-            }
+            winner = winer;
+            winBonus = winnerBonus;
+            finalAnswer = commitList[winner].revealAnswer;
+            winner.transfer(winBonus);
+            emit WinBonus(winner);
         }
+        isSettled = true;
     }
 
     ///@notice after the Retrieve Time, the owner can claim the deposit inside of the contract
     function retrieveBonus() external payable onlyOwner returns (bool _result) {
         require(block.timestamp >= tRetrieval);
-        require(!isSolved || isClaimed);
+        require(isSettled);
         require(!isRetrieved);
-        uint256 amount = address(this).balance - txFee;
+        uint256 amount = address(this).balance;
         owner.transfer(amount);
         emit RetriveBonus(amount);
         return true;
     }
 
+    ///@notice this is the hash function used in the contract
+    ///it encode the answer with the msg.sender's address
     function encodeAnswer(uint256[] memory _decodeAnswer)
         public
         view
@@ -304,7 +320,7 @@ abstract contract SUP is SUPInterface {
         _;
     }
 
-    modifier BeforeLaunch() {
+    modifier beforeLaunch() {
         require(!isLaunched);
         _;
     }
@@ -335,7 +351,6 @@ contract CSPContract is SUP {
     uint256 totalBonusTableValue;
 
     constructor(
-        uint256 _txFee,
         string memory _problemType,
         uint256 _tcrmin,
         uint256 _tcrmax,
@@ -351,7 +366,6 @@ contract CSPContract is SUP {
         owner = payable(msg.sender);
         tPropose = block.timestamp;
         settedBonus = msg.value;
-        txFee = _txFee;
         problemType = _problemType;
         tcrmax = _tcrmax;
         tcrmin = _tcrmin;
@@ -367,12 +381,12 @@ contract CSPContract is SUP {
 
     ///@notice only adding varibles and adding colors is allowed,
     ///because deleting varibles need great changes to the memory.
-    function addVaribles(uint256 _varibles) public onlyOwner BeforeLaunch {
+    function addVaribles(uint256 _varibles) public onlyOwner beforeLaunch {
         require(_varibles > varibles);
         varibles = _varibles;
     }
 
-    function addColors(uint256 _colors) public onlyOwner BeforeLaunch {
+    function addColors(uint256 _colors) public onlyOwner beforeLaunch {
         require(_colors > colors);
         colors = _colors;
     }
@@ -383,16 +397,13 @@ contract CSPContract is SUP {
     function addConstraints(
         uint256[] memory _constraint,
         uint256 _constraintBonus
-    ) public onlyOwner BeforeLaunch {
+    ) public onlyOwner beforeLaunch {
         require(checkIsIncreasingAndDifferent(_constraint));
         //due to the increasing order, verifying the last element is adequate.
         require(_constraint[_constraint.length - 1] < varibles);
 
         constraints[constraintsNumber] = _constraint;
-        require(
-            (totalBonusTableValue.add(_constraintBonus)) <=
-                settedBonus.sub(txFee)
-        );
+        require((totalBonusTableValue.add(_constraintBonus)) <= settedBonus);
         totalBonusTableValue.add(_constraintBonus);
         bonusTable.push(_constraintBonus);
         constraintsNumber++;
@@ -401,7 +412,7 @@ contract CSPContract is SUP {
     function addDomain(uint256 _varible, uint256[] memory _domain)
         public
         onlyOwner
-        BeforeLaunch
+        beforeLaunch
     {
         require(checkIsIncreasingAndDifferent(_domain));
         require(_domain[_domain.length - 1] < colors);
