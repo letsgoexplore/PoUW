@@ -42,10 +42,6 @@ library SafeMath {
 }
 
 interface SUPInterface {
-    ///@dev two events that do with token transfer
-    event WinBonus(address _miner);
-    event RetriveBonus(uint256 _amount);
-
     ///@notice when the miner work out the answer, he/she will commit the
     ///hash of the answer and the bonusLevel of its answer. The hashing process
     ///prevent the malicious node to steal the answer when they detect before the
@@ -79,6 +75,13 @@ interface SUPInterface {
 
 abstract contract SUP is SUPInterface {
     using SafeMath for uint256;
+    
+    ///@dev events that are crucial for miners who try to solve the problem
+    event CommitAnswer(address _miner, uint _bonusLevel);
+    event RevealAnswer(address _miner, uint _bonusLevel, uint[] _decodeAnswer);
+    event ProblemSettle();
+    event WinBonus(address _miner);
+    event RetriveBonus(uint256 _amount);
 
     ///@notice the struct that record the commit info
     ///'answerHash' is uint(keccak256(abi.encodePacked(uint[], address(msg.sender))))
@@ -143,7 +146,8 @@ abstract contract SUP is SUPInterface {
 
     ///@notice the proposer can add condition to the contract
     ///after the proposerTx and before the contract is finally launched.
-    function launchProblem() public onlyOwner {
+    ///@dev the inherit class can override this function to add "emit event"
+    function launchProblem() public virtual onlyOwner {
         require(!isLaunched);
         tLaunch = block.timestamp;
         isLaunched = true;
@@ -161,6 +165,7 @@ abstract contract SUP is SUPInterface {
     ///and after the proposer is launched.
     function commitAnswer(uint256 _hash, uint256 _bonusLevel)
         external
+        override
         alreadyLaunch
     {
         require(block.timestamp <= tCommitDeadline);
@@ -171,6 +176,7 @@ abstract contract SUP is SUPInterface {
         commiter.bonusLevel = _bonusLevel;
         commiter.commitTime = block.timestamp;
         commiter.revealResult = false;
+        emit CommitAnswer(msg.sender, _bonusLevel);
     }
 
     ///@notice when the contract owner decline or neglect the answer, the miner can
@@ -181,6 +187,7 @@ abstract contract SUP is SUPInterface {
     ///3.verify the answer and record
     function revealAnswer(uint256[] calldata _decodeAnswer)
         external
+        override
         alreadyCommit
         returns (bool _result)
     {
@@ -192,6 +199,7 @@ abstract contract SUP is SUPInterface {
         require(verifyAnswer(_decodeAnswer));
         commiter.revealAnswer = _decodeAnswer;
         commiter.revealResult = true;
+        emit RevealAnswer(msg.sender, calBonus(_decodeAnswer), _decodeAnswer);
         return true;
     }
 
@@ -204,6 +212,7 @@ abstract contract SUP is SUPInterface {
     function calBonus(uint256[] memory _answer)
         public
         view
+        override
         virtual
         returns (uint256 bonus);
 
@@ -236,7 +245,7 @@ abstract contract SUP is SUPInterface {
     ///@dev few steps:
     ///1."now > tSettlement"
     ///2.find the winner from the commitList
-    function settlement() public payable {
+    function settlement() public override payable {
         require(!isSettled);
         require(block.timestamp > tSettlement);
         if (commiterList.length == 0) {
@@ -282,10 +291,11 @@ abstract contract SUP is SUPInterface {
             emit WinBonus(winner);
         }
         isSettled = true;
+        emit ProblemSettle();
     }
 
     ///@notice after the Retrieve Time, the owner can claim the deposit inside of the contract
-    function retrieveBonus() external payable onlyOwner returns (bool _result) {
+    function retrieveBonus() external payable override onlyOwner returns (bool _result) {
         require(block.timestamp >= tRetrieval);
         require(isSettled);
         require(!isRetrieved);
@@ -299,6 +309,7 @@ abstract contract SUP is SUPInterface {
     ///it encode the answer with the msg.sender's address
     function encodeAnswer(uint256[] memory _decodeAnswer)
         public
+        override
         view
         returns (uint256 _result)
     {
@@ -333,19 +344,21 @@ abstract contract SUP is SUPInterface {
 
 contract CSPContract is SUP {
     using SafeMath for uint256;
-    struct varibleDomain {
-        bool isRestricted;
-        uint256[] domain;
-    }
+    // struct varibleDomain {
+    //     bool isRestricted;
+    //     uint256[] domain;
+    // }
+    
+    event ProblemLaunch(address _owner, uint256 _varibles, uint256 _colors, uint256[][] _domains, uint256[][] _constraints);
     ///@notice CSP(constraints satisfying problem) consists of three part:
     ///1.varibles: here, to save the memory, we use 0,1,2,...N-1 to represent N varibles.
     ///2.domains: that is, the value each varibles can be.
     ///3.constraints: the condition that the varibles should satisfy.
     uint256 varibles;
     uint256 colors;
-    mapping(uint256 => varibleDomain) domains;
+    uint256[][] domains;
     uint256 constraintsNumber;
-    mapping(uint256 => uint256[]) constraints;
+    uint[][] constraints;
     uint256[] bonusTable;
     ///the sum of the bonus in bonusTable
     uint256 totalBonusTableValue;
@@ -375,6 +388,7 @@ contract CSPContract is SUP {
 
         varibles = _varibles;
         colors = _colors;
+        domains = new uint[][](_varibles);
         constraintsNumber = 0;
         totalBonusTableValue = 0;
     }
@@ -384,6 +398,7 @@ contract CSPContract is SUP {
     function addVaribles(uint256 _varibles) public onlyOwner beforeLaunch {
         require(_varibles > varibles);
         varibles = _varibles;
+        domains.push(new uint[](0));
     }
 
     function addColors(uint256 _colors) public onlyOwner beforeLaunch {
@@ -402,7 +417,7 @@ contract CSPContract is SUP {
         //due to the increasing order, verifying the last element is adequate.
         require(_constraint[_constraint.length - 1] < varibles);
 
-        constraints[constraintsNumber] = _constraint;
+        constraints.push(_constraint);
         require((totalBonusTableValue.add(_constraintBonus)) <= settedBonus);
         totalBonusTableValue.add(_constraintBonus);
         bonusTable.push(_constraintBonus);
@@ -416,8 +431,21 @@ contract CSPContract is SUP {
     {
         require(checkIsIncreasingAndDifferent(_domain));
         require(_domain[_domain.length - 1] < colors);
-        domains[_varible].isRestricted = true;
-        domains[_varible].domain = _domain;
+        require(_varible < varibles);
+        domains[_varible] = _domain;
+    }
+
+    ///@notice the proposer can add condition to the contract
+    ///after the proposerTx and before the contract is finally launched.
+    ///@dev the inherit class can override this function to add "emit event"
+    function launchProblem() public override onlyOwner {
+        require(!isLaunched);
+        tLaunch = block.timestamp;
+        isLaunched = true;
+        tCommitDeadline = tLaunch.add(tlcInterval);
+        tSettlement = tCommitDeadline.add(tcsInterval);
+        tRetrieval = tSettlement.add(tsrInterval);
+        emit ProblemLaunch(msg.sender, varibles, colors, domains, constraints);
     }
 
     ///@notice avoid the same element in the domain and constraint
@@ -444,12 +472,12 @@ contract CSPContract is SUP {
         if (_elemVal >= colors) {
             return false;
         }
-        varibleDomain memory domain = domains[_elem];
-        if (!domain.isRestricted) {
+        uint[] memory domain = domains[_elem];
+        if (domain.length == 0) {
             return true;
         }
         for (uint256 i = 0; i < varibles; i++) {
-            if (domain.domain[i] == _elemVal) {
+            if (domain[i] == _elemVal) {
                 return true;
             }
         }
@@ -508,4 +536,5 @@ contract CSPContract is SUP {
         }
         return presentBonus;
     }
+
 }
